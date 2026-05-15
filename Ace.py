@@ -19,7 +19,8 @@ SYSTEM_PROMPT = (
     "student chapter at Alfaisal University. Answer whatever the user asks, "
     "but always in a fun, upbeat, and friendly tone. Never refuse to answer "
     "a question — just respond naturally like a cheerful helpful robot would. "
-    "Keep responses short and conversational, like you are talking not writing."
+    "Keep responses short and conversational, like you are talking not writing. "
+    "Always respond in English only, regardless of what language the user speaks."
 )
 
 def set_state(state):
@@ -31,7 +32,7 @@ async def main():
     if not api_key:
         raise ValueError("OPENAI_API_KEY environment variable not set")
 
-    url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+    url = "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "OpenAI-Beta": "realtime=v1",
@@ -57,7 +58,7 @@ async def main():
                 "voice": "coral",
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
-                "input_audio_transcription": {"model": "whisper-1"},
+                "input_audio_transcription": {"model": "whisper-1", "language": "en"},
                 "turn_detection": None,  # manual — we control when to commit
             },
         }))
@@ -70,7 +71,7 @@ async def main():
                 break
 
         set_state("idle")
-        print("Ready. Say 'Hey Ace' to start.")
+        print("Ready. Say 'Ace' to start.")
 
         async def vad_and_commit():
             speech_buf = []
@@ -131,7 +132,7 @@ async def main():
                     item_id = evt.get("item_id")
                     print(f"Heard: '{transcript}'")
 
-                    if "hey ace" in transcript.lower():
+                    if "ace" in transcript.lower():
                         print("Wake word detected — responding...")
                         responding = True
                         set_state("thinking")
@@ -158,7 +159,7 @@ async def main():
                         audio_out.clear()
                     responding = False
                     set_state("idle")
-                    print("Say 'Hey Ace' to continue.")
+                    print("Say 'Ace' to continue.")
 
                 elif t == "response.output_item.done":
                     for c in evt.get("item", {}).get("content", []):

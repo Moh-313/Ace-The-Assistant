@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Ace</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; background: #030810; overflow: hidden; }
+canvas { display: block; }
+#tip { position: fixed; bottom: 16px; right: 20px; color: rgba(255,255,255,0.18); font: 12px monospace; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="tip">click · fullscreen</div>
+<script>
+const cvs = document.getElementById('c');
+const ctx = cvs.getContext('2d');
+let W, H;
+
+function resize() { W = cvs.width = innerWidth; H = cvs.height = innerHeight; }
+resize();
+addEventListener('resize', resize);
+addEventListener('click', () => { if (!document.fullscreenElement) document.documentElement.requestFullscreen(); else document.exitFullscreen(); });
+addEventListener('keydown', e => { if (e.key === 'f') document.documentElement.requestFullscreen(); });
+document.addEventListener('fullscreenchange', () => { document.getElementById('tip').style.display = document.fullscreenElement ? 'none' : ''; });
+
+// ── State ────────────────────────────────────────────────────
+let state = 'idle';
+(async function poll() {
+  try { const d = await (await fetch('/state')).json(); state = d.state || 'idle'; } catch(_) {}
+  setTimeout(poll, 80);
+})();
+
+// ── Colors ───────────────────────────────────────────────────
+const PALETTE = {
+  idle:      [0,   212, 255],
+  listening: [68,  136, 255],
+  thinking:  [255, 170,   0],
+  speaking:  [0,   255, 136],
+  happy:     [255, 220,  60],
+};
+let cc = [...PALETTE.idle];
+const lerp  = (a, b, t) => a + (b - a) * t;
+const lerpA = (a, b, t) => a.map((v, i) => lerp(v, b[i], t));
+const rgb   = (c, a = 1) => `rgba(${c[0]|0},${c[1]|0},${c[2]|0},${a})`;
+
+// ── Time ─────────────────────────────────────────────────────
+let T = 0, last = null;
+
+// ── Smoothed values ──────────────────────────────────────────
+let blink = 1, blinkPhase = 0, blinkCD = 3;
+let mouthOpen = 0, mouthCurve = 0.5, mouthW = 0.7;
+let pupilX = 0, pupilY = 0;
+let browLift = 0, browFurrow = 0, faceGlow = 0.4;
+
+// ── Particles ────────────────────────────────────────────────
+const pts = [];
+function spawnPt(cx, cy) {
+  const a = Math.random() * Math.PI * 2, s = 1.5 + Math.random() * 4;
+  pts.push({ x: cx + (Math.random() - .5) * 60, y: cy + (Math.random() - .5) * 30,
+    vx: Math.cos(a) * s, vy: Math.sin(a) * s - 2.5,
+    life: 1, size: 2 + Math.random() * 4 });
+}
+
+// ── Sound waves ──────────────────────────────────────────────
+const waves = [];
+let waveCD = 0;
+
+// ── Update ───────────────────────────────────────────────────
+function update(dt) {
+  T += dt;
+  cc = lerpA(cc, PALETTE[state] || PALETTE.idle, dt * 5);
+
+  // Blink
+  blinkCD -= dt;
+  if (blinkPhase === 0 && blinkCD <= 0) { blinkPhase = 1; blinkCD = 3 + Math.random() * 4; }
+  if (blinkPhase === 1) { blink -= dt * 14; if (blink <= 0) { blink = 0; blinkPhase = 2; } }
+  if (blinkPhase === 2) { blink += dt * 10; if (blink >= 1) { blink = 1; blinkPhase = 0; } }
+
+  // State targets
+  let tMO = 0, tMC = 0.48, tMW = 0.7, tPX = 0, tPY = 0, tBL = 0, tBF = 0, tGl = 0.38;
+
+  if (state === 'idle') {
+    tMC = 0.48;
+  } else if (state === 'happy') {
+    tMC = 0.95; tBL = 0.55; tGl = 0.8;
+    blink = Math.min(1, blink + dt * 5);
+  } else if (state === 'listening') {
+    tMO = 0.13; tMC = 0.08; tMW = 0.55; tBL = 0.75; tGl = 0.72;
+    blink = Math.min(1, blink + dt * 10);
+  } else if (state === 'thinking') {
+    tPX = -0.09; tPY = -0.07; tBF = 0.85; tMC = -0.05; tGl = 0.52;
+  } else if (state === 'speaking') {
+    tMO = 0.1 + Math.abs(Math.sin(T * 7.3)) * 0.48 + Math.abs(Math.sin(T * 13.1)) * 0.28;
+    tMC = 0.22; tMW = 0.9; tGl = 0.95;
+  }
+
+  const sp = Math.min(1, dt * 12);
+  mouthOpen  = lerp(mouthOpen,  tMO, sp * 1.5);
+  mouthCurve = lerp(mouthCurve, tMC, sp * 0.65);
+  mouthW     = lerp(mouthW,     tMW, sp);
+  pupilX     = lerp(pupilX,     tPX, sp);
+  pupilY     = lerp(pupilY,     tPY, sp);
+  browLift   = lerp(browLift,   tBL, sp);
+  browFurrow = lerp(browFurrow, tBF, sp);
+  faceGlow   = lerp(faceGlow,   tGl, sp);
+
+  // Particles
+  const cx = W / 2, cy = H / 2;
+  if ((state === 'speaking' || state === 'happy') && Math.random() < dt * 9) spawnPt(cx, cy);
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i];
+    p.x += p.vx; p.y += p.vy; p.vy += 0.09;
+    p.life -= dt * 0.85;
+    if (p.life <= 0) pts.splice(i, 1);
+  }
+
+  // Waves
+  if (state === 'listening') {
+    waveCD -= dt;
+    if (waveCD <= 0) { waveCD = 0.42; waves.push({ r: 0, life: 1 }); }
+  } else { waves.length = 0; waveCD = 0; }
+  for (let i = waves.length - 1; i >= 0; i--) {
+    waves[i].r += dt; waves[i].life -= dt * 1.25;
+    if (waves[i].life <= 0) waves.splice(i, 1);
+  }
+}
+
+// ── Draw helpers ─────────────────────────────────────────────
+function shadow(color, blur) { ctx.shadowColor = color; ctx.shadowBlur = blur; }
+function clearShadow()        { ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; }
+
+// ── Draw ─────────────────────────────────────────────────────
+function draw() {
+  const cx = W / 2, cy = H / 2;
+  const R  = Math.min(W, H) * 0.32;
+  const bob = Math.sin(T * 0.88) * R * 0.023;
+  const fy  = cy + bob;
+
+  // Background
+  ctx.fillStyle = '#030810';
+  ctx.fillRect(0, 0, W, H);
+
+  // BG glow
+  let g = ctx.createRadialGradient(cx, fy, 0, cx, fy, R * 3);
+  g.addColorStop(0, rgb(cc, 0.07)); g.addColorStop(1, rgb(cc, 0));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  // Grid
+  ctx.save(); ctx.globalAlpha = 0.022; ctx.strokeStyle = rgb(cc); ctx.lineWidth = 1;
+  const gs = 54;
+  for (let x = 0; x < W; x += gs) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+  for (let y = 0; y < H; y += gs) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+  ctx.restore();
+
+  // Listening waves
+  for (const w of waves) {
+    ctx.beginPath();
+    ctx.arc(cx, fy, R * (1.05 + w.r * 0.9), 0, Math.PI * 2);
+    ctx.strokeStyle = rgb(cc, w.life * 0.32);
+    ctx.lineWidth = 2.5; ctx.stroke();
+  }
+
+  // Thinking orbit
+  if (browFurrow > 0.05) {
+    const alpha = Math.min(browFurrow * 1.6, 1);
+    for (let i = 0; i < 6; i++) {
+      const a  = (i / 6) * Math.PI * 2 + T * 1.5;
+      const or = R * 1.16;
+      const ox = cx + Math.cos(a) * or;
+      const oy = fy + Math.sin(a) * or * 0.28;
+      const sz = (4 + Math.sin(T * 3.5 + i * 1.1) * 2) * alpha;
+      ctx.beginPath(); ctx.arc(ox, oy, Math.max(sz, 0.5), 0, Math.PI * 2);
+      ctx.fillStyle = rgb(cc, 0.6 * alpha); ctx.fill();
+    }
+  }
+
+  // Outer glow rings
+  const glowPulse = state === 'speaking' ? 1 + Math.sin(T * 9.5) * 0.12 : 1;
+  for (let i = 3; i >= 0; i--) {
+    const rr = (R + 7 + i * 11 + Math.sin(T * 1.7 + i * 0.9) * 4) * glowPulse;
+    ctx.beginPath(); ctx.arc(cx, fy, rr, 0, Math.PI * 2);
+    ctx.strokeStyle = rgb(cc, (0.055 - i * 0.008) * faceGlow * 2.2);
+    ctx.lineWidth = 3; ctx.stroke();
+  }
+
+  // Face shadow
+  ctx.save();
+  shadow(rgb(cc, faceGlow * 0.9), R * 0.38);
+  ctx.beginPath(); ctx.arc(cx, fy, R, 0, Math.PI * 2);
+  ctx.fillStyle = 'transparent'; ctx.fill();
+  ctx.restore();
+
+  // Face body
+  g = ctx.createRadialGradient(cx - R * 0.22, fy - R * 0.22, 0, cx, fy, R);
+  g.addColorStop(0, '#16313f'); g.addColorStop(1, '#060e18');
+  ctx.beginPath(); ctx.arc(cx, fy, R, 0, Math.PI * 2);
+  ctx.fillStyle = g; ctx.fill();
+
+  // Face border
+  ctx.save();
+  shadow(rgb(cc, 0.9), 22);
+  ctx.beginPath(); ctx.arc(cx, fy, R, 0, Math.PI * 2);
+  ctx.strokeStyle = rgb(cc, 0.88); ctx.lineWidth = 2.5; ctx.stroke();
+  clearShadow(); ctx.restore();
+
+  // Inner top highlight
+  g = ctx.createLinearGradient(cx, fy - R, cx, fy - R * 0.35);
+  g.addColorStop(0, rgb(cc, 0.09)); g.addColorStop(1, rgb(cc, 0));
+  ctx.save(); ctx.beginPath(); ctx.arc(cx, fy, R - 2, 0, Math.PI * 2); ctx.clip();
+  ctx.fillStyle = g; ctx.fillRect(cx - R, fy - R, R * 2, R * 0.72);
+  ctx.restore();
+
+  // ── Eyes ─────────────────────────────────────────────────────
+  const er  = R * 0.155;
+  const eox = R * 0.29;
+  const eoy = R * 0.08;
+
+  for (const side of [-1, 1]) {
+    const ex = cx + side * eox;
+    const ey = fy - eoy;
+
+    // Socket + glow
+    ctx.save(); shadow(rgb(cc, 0.7), er * 1.8);
+    ctx.beginPath(); ctx.arc(ex, ey, er, 0, Math.PI * 2);
+    ctx.fillStyle = '#020508'; ctx.fill();
+    clearShadow(); ctx.restore();
+
+    // Iris (clipped to blink height)
+    const openH = Math.max(er * blink, 0.5);
+    ctx.save();
+    ctx.beginPath(); ctx.ellipse(ex, ey, er + 1, openH, 0, 0, Math.PI * 2); ctx.clip();
+
+    const ig = ctx.createRadialGradient(ex, ey, 0, ex, ey, er);
+    ig.addColorStop(0,   rgb(cc, 1));
+    ig.addColorStop(0.5, rgb(cc, 0.72));
+    ig.addColorStop(1,   rgb(cc, 0.12));
+    ctx.beginPath(); ctx.arc(ex, ey, er, 0, Math.PI * 2);
+    ctx.fillStyle = ig; ctx.fill();
+
+    // Pupil
+    const prx = ex + pupilX * er * 1.8;
+    const pry = ey + pupilY * er * 1.8;
+    ctx.beginPath(); ctx.arc(prx, pry, er * 0.37, 0, Math.PI * 2);
+    ctx.fillStyle = '#020508'; ctx.fill();
+
+    // Specular highlights
+    ctx.beginPath(); ctx.arc(prx - er * 0.17, pry - er * 0.19, er * 0.13, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(prx + er * 0.1, pry - er * 0.07, er * 0.065, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.fill();
+    ctx.restore();
+
+    // Eyelids (cover closed portion with socket color)
+    const closed = 1 - blink;
+    if (closed > 0.01) {
+      const lidH = er * closed + 1;
+      for (const [ry, rh] of [[ey - er - 2, lidH + 2], [ey + er * blink - 0.5, lidH + 2]]) {
+        ctx.save();
+        ctx.beginPath(); ctx.rect(ex - er - 2, ry, (er + 2) * 2, rh); ctx.clip();
+        ctx.beginPath(); ctx.arc(ex, ey, er, 0, Math.PI * 2);
+        ctx.fillStyle = '#020508'; ctx.fill();
+        ctx.restore();
+      }
+    }
+  }
+
+  // ── Eyebrows ─────────────────────────────────────────────────
+  const browBaseY = fy - eoy - er * 1.5;
+  const browHW    = er * 0.82;
+  ctx.save();
+  shadow(rgb(cc, 0.4), 8);
+  ctx.lineWidth = er * 0.2; ctx.lineCap = 'round'; ctx.strokeStyle = rgb(cc, 0.82);
+  for (const side of [-1, 1]) {
+    const bx   = cx + side * eox;
+    const by   = browBaseY - browLift * er * 0.38;
+    const tilt = browFurrow * side * er * 0.2;
+    ctx.beginPath();
+    ctx.moveTo(bx - browHW, by + tilt);
+    ctx.quadraticCurveTo(bx, by - er * 0.14 - browLift * er * 0.1, bx + browHW, by - tilt);
+    ctx.stroke();
+  }
+  clearShadow(); ctx.restore();
+
+  // ── Mouth ─────────────────────────────────────────────────────
+  const mouthY = fy + R * 0.3;
+  const mw     = R * 0.42 * mouthW;
+  const mh     = Math.max(mouthOpen * R * 0.18, 0);
+
+  ctx.save();
+  shadow(rgb(cc, 0.4), 14);
+
+  if (mouthOpen > 0.05) {
+    // Open mouth ellipse
+    ctx.beginPath(); ctx.ellipse(cx, mouthY, mw * 0.68, Math.max(mh, er * 0.08), 0, 0, Math.PI * 2);
+    ctx.fillStyle = '#020508'; ctx.fill();
+
+    if (mh > er * 0.12) {
+      // Inner glow
+      const mg = ctx.createRadialGradient(cx, mouthY, 0, cx, mouthY, mw * 0.6);
+      mg.addColorStop(0, rgb(cc, 0.22)); mg.addColorStop(1, rgb(cc, 0));
+      ctx.fillStyle = mg; ctx.fill();
+      // Teeth hint
+      const ta = Math.min(0.55, (mouthOpen - 0.1) * 0.75);
+      if (ta > 0) {
+        ctx.fillStyle = `rgba(255,255,255,${ta})`;
+        ctx.fillRect(cx - mw * 0.34, mouthY - mh * 0.18, mw * 0.68, mh * 0.22);
+      }
+    }
+    ctx.strokeStyle = rgb(cc, 0.85); ctx.lineWidth = 2; ctx.stroke();
+  } else {
+    // Smile / neutral / frown (quadratic curve)
+    const depth = mouthCurve * R * 0.1;
+    ctx.beginPath();
+    ctx.moveTo(cx - mw * 0.55, mouthY);
+    ctx.quadraticCurveTo(cx, mouthY + depth, cx + mw * 0.55, mouthY);
+    ctx.strokeStyle = rgb(cc, 0.88); ctx.lineWidth = er * 0.24; ctx.lineCap = 'round';
+    ctx.stroke();
+  }
+  clearShadow(); ctx.restore();
+
+  // ── Particles ─────────────────────────────────────────────────
+  for (const p of pts) {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, Math.max(0.5, p.size * p.life), 0, Math.PI * 2);
+    ctx.fillStyle = rgb(cc, p.life * 0.72);
+    ctx.fill();
+  }
+
+  // ── State label ───────────────────────────────────────────────
+  const LABELS = { listening: 'LISTENING', thinking: 'THINKING', speaking: 'SPEAKING', happy: 'HEY THERE!' };
+  const lbl = LABELS[state];
+  if (lbl) {
+    const fs = Math.max(12, Math.round(er * 0.58));
+    ctx.font = `600 ${fs}px "Courier New", monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = rgb(cc, 0.42 + Math.sin(T * 2.5) * 0.1);
+    ctx.fillText(lbl, cx, fy + R * 1.16);
+    const tw = ctx.measureText(lbl).width;
+    const ly = fy + R * 1.16 - fs * 0.38;
+    ctx.strokeStyle = rgb(cc, 0.28); ctx.lineWidth = 1;
+    for (const s of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(cx + s * (tw / 2 + 8), ly); ctx.lineTo(cx + s * (tw / 2 + 28), ly);
+      ctx.stroke();
+    }
+  }
+}
+
+// ── Loop ─────────────────────────────────────────────────────
+function frame(ts) {
+  if (!last) last = ts;
+  const dt = Math.min((ts - last) / 1000, 0.05);
+  last = ts;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
