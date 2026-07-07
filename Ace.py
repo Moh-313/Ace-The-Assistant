@@ -1,13 +1,14 @@
 import asyncio
-import websockets
-import json
 import base64
 import sounddevice as sd
 import numpy as np
 import os
 import wave
 import io
+import subprocess
+import yt_dlp
 from datetime import datetime, timezone
+from openai import AsyncOpenAI
 from piper.voice import PiperVoice
 
 INPUT_DEVICE  = 1
@@ -33,7 +34,7 @@ SYSTEM_PROMPT = (
     "student chapter at Alfaisal University. Answer whatever the user asks, "
     "but always in a fun, upbeat, and friendly tone. Never refuse to answer "
     "a question — just respond naturally like a cheerful helpful robot would. "
-    "Keep responses very short — 1 or 2 sentences max, like you are talking not writing. "
+    "Keep responses very short — never more than 12 words total, like you are talking not writing. Always finish your sentence completely before stopping. "
     "Always respond in English only, regardless of what language the user speaks. "
     "Never use emojis or special symbols in your responses. "
     "You will be given the current date/time and web search results before each response — "
@@ -41,6 +42,8 @@ SYSTEM_PROMPT = (
 )
 
 voice = PiperVoice.load(VOICE_MODEL)
+
+music_process = None
 
 def set_state(state):
     with open(STATE_FILE, "w") as f:
@@ -69,6 +72,32 @@ def web_search(query):
     except Exception:
         return []
 
+def play_youtube(song_name):
+    global music_process
+    stop_music()
+    try:
+        ydl_opts = {"format": "bestaudio/best", "quiet": True, "no_warnings": True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{song_name}", download=False)
+            entry = info.get("entries", [info])[0]
+            url = entry["url"]
+            title = entry.get("title", song_name)
+        music_process = subprocess.Popen(
+            ["mpv", "--no-video", "--really-quiet", url],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        print(f"Now playing: {title}")
+        return f"Playing {title}!"
+    except Exception as e:
+        print(f"YouTube error: {e}")
+        return "Sorry, I could not find that song."
+
+def stop_music():
+    global music_process
+    if music_process and music_process.poll() is None:
+        music_process.terminate()
+        music_process = None
+
 def trim_to_sentence(text):
     last = max(text.rfind("."), text.rfind("!"), text.rfind("?"))
     return text[:last + 1] if last != -1 else text
@@ -90,44 +119,26 @@ async def main():
     if not api_key:
         raise ValueError("OPENAI_API_KEY environment variable not set")
 
-    url = "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview"
-    headers = {"Authorization": f"Bearer {api_key}"}
-
+    client = AsyncOpenAI(api_key=api_key)
     loop = asyncio.get_running_loop()
     text_buf = []
+    transcript_buf = {}
     audio_queue = asyncio.Queue()
     responding = False
 
-    async with websockets.connect(url, additional_headers=headers, max_size=None) as ws:
-        print("Connecting...")
-        while True:
-            evt = json.loads(await ws.recv())
-            if evt["type"] == "session.created":
-                break
-
-        await ws.send(json.dumps({
-            "type": "session.update",
-            "session": {
-                "type": "realtime",
-                "model": "gpt-4o-mini-realtime-preview",
-                "instructions": SYSTEM_PROMPT,
-                "output_modalities": ["text"],
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcm", "rate": 24000},
-                        "transcription": {"model": "whisper-1", "language": "en"},
-                        "turn_detection": None,
-                    },
+    print("Connecting...")
+    async with client.realtime.connect(model="gpt-realtime-mini") as conn:
+        await conn.session.update(session={
+            "type": "realtime",
+            "instructions": SYSTEM_PROMPT,
+            "output_modalities": ["text"],
+            "audio": {
+                "input": {
+                    "transcription": {"model": "whisper-1"},
+                    "turn_detection": None,
                 },
             },
-        }))
-
-        while True:
-            evt = json.loads(await ws.recv())
-            if evt["type"] == "error":
-                raise RuntimeError(f"API error: {evt.get('error')}")
-            if evt["type"] == "session.updated":
-                break
+        })
 
         set_state("idle")
         print("Ready. Say 'Ace' to start.")
@@ -157,13 +168,12 @@ async def main():
                         if duration >= MIN_SPEECH_SECS:
                             full = np.concatenate(speech_buf)
                             pcm = (full * 32767).astype(np.int16).tobytes()
-                            await ws.send(json.dumps({
-                                "type": "input_audio_buffer.append",
-                                "audio": base64.b64encode(pcm).decode(),
-                            }))
-                            await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                            await conn.input_audio_buffer.append(
+                                audio=base64.b64encode(pcm).decode()
+                            )
+                            await conn.input_audio_buffer.commit()
                         else:
-                            await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                            await conn.input_audio_buffer.clear()
                         speech_buf.clear()
                         is_speaking = False
                         silence_count = 0
@@ -176,60 +186,75 @@ async def main():
                             blocksize=CHUNK_SIZE, callback=mic_callback, device=INPUT_DEVICE):
             vad = asyncio.create_task(vad_and_commit())
 
-            async for raw in ws:
-                evt = json.loads(raw)
-                t = evt.get("type", "")
+            async for event in conn:
+                t = event.type
 
                 if t == "conversation.item.input_audio_transcription.delta":
-                    transcript = evt.get("delta", "").strip()
-                    item_id = evt.get("item_id")
+                    item_id = getattr(event, "item_id", None)
+                    if item_id:
+                        transcript_buf[item_id] = transcript_buf.get(item_id, "") + getattr(event, "delta", "")
+
+                elif t == "conversation.item.input_audio_transcription.completed":
+                    item_id = getattr(event, "item_id", None)
+                    transcript = (getattr(event, "transcript", None) or transcript_buf.pop(item_id, "")).strip()
                     print(f"Heard: '{transcript}'")
 
                     if "ace" in transcript.lower():
-                        print("Wake word detected — responding...")
-                        responding = True
-                        set_state("thinking")
-
                         query = transcript.lower().replace("ace", "").strip(" ,.")
-                        now = datetime.now(timezone.utc).strftime("%A, %B %d %Y, %H:%M UTC")
 
-                        if needs_search(query):
-                            print(f"Searching: '{query}'")
-                            results = await loop.run_in_executor(None, web_search, query)
-                            snippets = "\n".join(
-                                f"- {r.get('title','')}: {r.get('body','')}"
-                                for r in results
-                            ) if results else "No results found."
-                            context = (f"Current date and time: {now}\n\n"
-                                       f"Web search results for '{query}':\n{snippets}")
+                        if "stop" in query:
+                            stop_music()
+                            await loop.run_in_executor(None, synthesize_and_play, "Stopped.")
+                            set_state("idle")
+
+                        elif query.startswith("play") or " play " in query:
+                            song = query.replace("play", "").strip(" ,.")
+                            responding = True
+                            set_state("thinking")
+                            announcement = await loop.run_in_executor(None, play_youtube, song)
+                            set_state("speaking")
+                            await loop.run_in_executor(None, synthesize_and_play, announcement)
+                            responding = False
+                            set_state("idle")
+
                         else:
-                            context = f"Current date and time: {now}"
+                            print("Wake word detected — responding...")
+                            responding = True
+                            set_state("thinking")
+                            now = datetime.now(timezone.utc).strftime("%A, %B %d %Y, %H:%M UTC")
 
-                        await ws.send(json.dumps({
-                            "type": "conversation.item.create",
-                            "item": {
+                            if needs_search(query):
+                                print(f"Searching: '{query}'")
+                                await asyncio.sleep(1)
+                                await loop.run_in_executor(None, synthesize_and_play, "Let me look that up for you.")
+                                results = await loop.run_in_executor(None, web_search, query)
+                                snippets = "\n".join(
+                                    f"- {r.get('title','')}: {r.get('body','')}"
+                                    for r in results
+                                ) if results else "No results found."
+                                context = (f"Current date and time: {now}\n\n"
+                                           f"Web search results for '{query}':\n{snippets}")
+                            else:
+                                context = f"Current date and time: {now}"
+
+                            await conn.conversation.item.create(item={
                                 "type": "message",
                                 "role": "user",
                                 "content": [{"type": "input_text", "text": context}],
-                            },
-                        }))
-                        await ws.send(json.dumps({
-                            "type": "response.create",
-                            "response": {"max_output_tokens": 20},
-                        }))
+                            })
+                            await conn.response.create(response={"max_output_tokens": 20})
 
                     else:
                         if item_id:
-                            await ws.send(json.dumps({
-                                "type": "conversation.item.delete",
-                                "item_id": item_id,
-                            }))
+                            await conn.conversation.item.delete(item_id=item_id)
 
                 elif t == "response.output_text.delta":
-                    text_buf.append(evt.get("delta", ""))
+                    text_buf.append(getattr(event, "delta", ""))
 
                 elif t == "response.output_text.done":
-                    full_text = trim_to_sentence(evt.get("text", "").strip() or "".join(text_buf).strip())
+                    full_text = trim_to_sentence(
+                        (getattr(event, "text", "") or "".join(text_buf)).strip()
+                    )
                     text_buf.clear()
                     if full_text:
                         print(f"Ace: {full_text}")
@@ -240,7 +265,7 @@ async def main():
                     print("Say 'Ace' to continue.")
 
                 elif t == "error":
-                    print(f"Error: {evt.get('error', {})}")
+                    print(f"Error: {getattr(event, 'error', {})}")
 
             vad.cancel()
 
