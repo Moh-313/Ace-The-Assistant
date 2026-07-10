@@ -20,7 +20,7 @@ STATE_FOLDERS = {
 pygame.init()
 info = pygame.display.Info()
 W, H = info.current_w, info.current_h
-screen = pygame.display.set_mode((W, H), pygame.FULLSCREEN)
+screen = pygame.display.set_mode((W, H), pygame.NOFRAME)
 pygame.display.set_caption("Ace")
 clock = pygame.time.Clock()
 

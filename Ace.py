@@ -21,7 +21,17 @@ SILENCE_SECS     = 0.4
 MIN_SPEECH_SECS  = 0.2
 
 STATE_FILE  = "ace_state.txt"
+CMD_FILE    = "ace_command.txt"
+LANG_FILE   = "ace_lang.txt"
 VOICE_MODEL = "en_GB-semaine-medium.onnx"
+
+DEMO_SCRIPT = [
+    "Hi there! I'm Ace, the robot assistant for ACM SIGSOFT at Alfaisal University. Say my name to ask me anything!",
+    "ACM SIGSOFT is where future software engineers connect, compete, and build things that actually matter!",
+    "Software engineering is not just coding — it is about solving real problems for real people!",
+    "From AI to cybersecurity, the ACM chapter at Alfaisal brings the future of tech straight to your campus!",
+    "The best software in the world starts with great engineers — and great engineers start right here at Alfaisal!",
+]
 
 NO_SEARCH_PHRASES = {
     "hello", "hi", "hey", "thanks", "thank you", "bye", "goodbye",
@@ -48,6 +58,13 @@ music_process = None
 def set_state(state):
     with open(STATE_FILE, "w") as f:
         f.write(state)
+
+def get_lang():
+    try:
+        with open(LANG_FILE, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return "en"
 
 def needs_search(query):
     q = query.lower().strip()
@@ -120,11 +137,27 @@ async def main():
         raise ValueError("OPENAI_API_KEY environment variable not set")
 
     client = AsyncOpenAI(api_key=api_key)
-    loop = asyncio.get_running_loop()
-    text_buf = []
+    loop          = asyncio.get_running_loop()
+    text_buf      = []
     transcript_buf = {}
-    audio_queue = asyncio.Queue()
-    responding = False
+    audio_queue   = asyncio.Queue()
+    cmd_queue     = asyncio.Queue()
+    responding    = False
+    last_text     = ""
+    demo_idx      = 0
+
+    async def poll_commands():
+        while True:
+            await asyncio.sleep(0.5)
+            try:
+                with open(CMD_FILE, "r") as f:
+                    cmd = f.read().strip()
+                if cmd:
+                    with open(CMD_FILE, "w") as f:
+                        f.write("")
+                    await cmd_queue.put(cmd)
+            except Exception:
+                pass
 
     print("Connecting...")
     async with client.realtime.connect(model="gpt-realtime-mini") as conn:
@@ -182,9 +215,57 @@ async def main():
         def mic_callback(indata, _frames, _time_info, _status):
             loop.call_soon_threadsafe(audio_queue.put_nowait, indata.copy())
 
+        async def handle_commands():
+            nonlocal responding, last_text, demo_idx
+            while True:
+                cmd = await cmd_queue.get()
+                if responding:
+                    continue
+                responding = True
+
+                if cmd == "repeat":
+                    if last_text:
+                        set_state("speaking")
+                        await loop.run_in_executor(None, synthesize_and_play, last_text)
+                        set_state("idle")
+                    responding = False
+
+                elif cmd == "demo":
+                    text = DEMO_SCRIPT[demo_idx % len(DEMO_SCRIPT)]
+                    demo_idx += 1
+                    print(f"Demo: {text}")
+                    set_state("speaking")
+                    await loop.run_in_executor(None, synthesize_and_play, text)
+                    last_text = text
+                    set_state("idle")
+                    responding = False
+
+                else:
+                    prompts = {
+                        "acm_info": "In one sentence, tell the audience why they should join the ACM SIGSOFT student chapter at Alfaisal University.",
+                        "joke":     "Tell me a short programming joke. One sentence only.",
+                        "fun_fact": "Give me one surprising fun fact about software engineering. One sentence only.",
+                    }
+                    prompt = prompts.get(cmd)
+                    if prompt:
+                        if get_lang() == "ar":
+                            prompt += " Respond in Arabic only."
+                        set_state("thinking")
+                        await conn.conversation.item.create(item={
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": prompt}],
+                        })
+                        await conn.response.create(response={"max_output_tokens": 60})
+                        # responding=False is set by the response.output_text.done handler
+                    else:
+                        responding = False
+
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype=np.float32,
                             blocksize=CHUNK_SIZE, callback=mic_callback, device=INPUT_DEVICE):
-            vad = asyncio.create_task(vad_and_commit())
+            vad  = asyncio.create_task(vad_and_commit())
+            poll = asyncio.create_task(poll_commands())
+            cmds = asyncio.create_task(handle_commands())
 
             async for event in conn:
                 t = event.type
@@ -237,6 +318,9 @@ async def main():
                             else:
                                 context = f"Current date and time: {now}"
 
+                            if get_lang() == "ar":
+                                context += "\n\nRespond in Arabic only."
+
                             await conn.conversation.item.create(item={
                                 "type": "message",
                                 "role": "user",
@@ -258,6 +342,7 @@ async def main():
                     text_buf.clear()
                     if full_text:
                         print(f"Ace: {full_text}")
+                        last_text = full_text
                         set_state("speaking")
                         await loop.run_in_executor(None, synthesize_and_play, full_text)
                     responding = False
@@ -268,6 +353,8 @@ async def main():
                     print(f"Error: {getattr(event, 'error', {})}")
 
             vad.cancel()
+            poll.cancel()
+            cmds.cancel()
 
 if __name__ == "__main__":
     asyncio.run(main())
