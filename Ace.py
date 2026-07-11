@@ -11,10 +11,12 @@ from datetime import datetime, timezone
 from openai import AsyncOpenAI
 from piper.voice import PiperVoice
 
-INPUT_DEVICE  = 1
-OUTPUT_DEVICE = 5
+INPUT_DEVICE  = int(os.getenv("ACE_INPUT_DEVICE",  "1"))
+OUTPUT_DEVICE = int(os.getenv("ACE_OUTPUT_DEVICE", "5"))
 
-SAMPLE_RATE      = 24000
+SAMPLE_RATE      = int(os.getenv("ACE_SAMPLE_RATE", "24000"))
+OUTPUT_RATE      = int(os.getenv("ACE_OUTPUT_RATE", "0")) or None  # None = use native rate
+API_SAMPLE_RATE  = 24000   # Realtime API always expects 24000
 CHUNK_SIZE       = 2048
 SILENCE_RMS      = 0.02
 SILENCE_SECS     = 0.4
@@ -44,16 +46,18 @@ SYSTEM_PROMPT = (
     "student chapter at Alfaisal University. Answer whatever the user asks, "
     "but always in a fun, upbeat, and friendly tone. Never refuse to answer "
     "a question — just respond naturally like a cheerful helpful robot would. "
-    "Keep responses very short — never more than 12 words total, like you are talking not writing. Always finish your sentence completely before stopping. "
-    "Always respond in English only, regardless of what language the user speaks. "
+    "Keep responses very short — never more than 2 sentences, like you are talking not writing. Always finish your sentence completely before stopping. "
     "Never use emojis or special symbols in your responses. "
-    "You will be given the current date/time and web search results before each response — "
-    "use them to give accurate, up-to-date answers."
+    "You will be given the current date/time, language instruction, and web search results before each response — "
+    "always follow the language instruction exactly."
 )
 
 voice = PiperVoice.load(VOICE_MODEL)
 
 music_process = None
+
+with open(LANG_FILE, "w") as f:
+    f.write("en")
 
 def set_state(state):
     with open(STATE_FILE, "w") as f:
@@ -119,6 +123,16 @@ def trim_to_sentence(text):
     last = max(text.rfind("."), text.rfind("!"), text.rfind("?"))
     return text[:last + 1] if last != -1 else text
 
+def play_audio(audio, src_rate):
+    target_rate = OUTPUT_RATE or src_rate
+    if target_rate != src_rate:
+        from scipy.signal import resample_poly
+        import math
+        g = math.gcd(target_rate, src_rate)
+        audio = resample_poly(audio, target_rate // g, src_rate // g).astype(np.float32)
+    sd.play(audio, samplerate=target_rate, device=OUTPUT_DEVICE)
+    sd.wait()
+
 def synthesize_and_play(text):
     wav_io = io.BytesIO()
     with wave.open(wav_io, "wb") as wf:
@@ -126,10 +140,9 @@ def synthesize_and_play(text):
     wav_io.seek(0)
     with wave.open(wav_io, "rb") as wf:
         frames = wf.readframes(wf.getnframes())
-        sample_rate = wf.getframerate()
+        src_rate = wf.getframerate()
     audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767.0
-    sd.play(audio, samplerate=sample_rate, device=OUTPUT_DEVICE)
-    sd.wait()
+    play_audio(audio, src_rate)
 
 async def main():
     api_key = os.getenv("OPENAI_API_KEY")
@@ -138,6 +151,29 @@ async def main():
 
     client = AsyncOpenAI(api_key=api_key)
     loop          = asyncio.get_running_loop()
+
+    async def speak(text, force_lang=None):
+        try:
+            lang = force_lang or get_lang()
+            if lang == "ar":
+                response = await client.audio.speech.create(
+                    model="tts-1",
+                    voice="alloy",
+                    input=text,
+                    response_format="wav"
+                )
+                def play_openai_wav():
+                    wav_io = io.BytesIO(response.content)
+                    with wave.open(wav_io, "rb") as wf:
+                        frames   = wf.readframes(wf.getnframes())
+                        src_rate = wf.getframerate()
+                    audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767.0
+                    play_audio(audio, src_rate)
+                await loop.run_in_executor(None, play_openai_wav)
+            else:
+                await loop.run_in_executor(None, synthesize_and_play, text)
+        except Exception as e:
+            print(f"Speech error: {e}")
     text_buf      = []
     transcript_buf = {}
     audio_queue   = asyncio.Queue()
@@ -200,6 +236,9 @@ async def main():
                         duration = len(speech_buf) * CHUNK_SIZE / SAMPLE_RATE
                         if duration >= MIN_SPEECH_SECS:
                             full = np.concatenate(speech_buf)
+                            if SAMPLE_RATE != API_SAMPLE_RATE:
+                                from scipy.signal import resample_poly
+                                full = resample_poly(full, API_SAMPLE_RATE, SAMPLE_RATE).astype(np.float32)
                             pcm = (full * 32767).astype(np.int16).tobytes()
                             await conn.input_audio_buffer.append(
                                 audio=base64.b64encode(pcm).decode()
@@ -226,7 +265,7 @@ async def main():
                 if cmd == "repeat":
                     if last_text:
                         set_state("speaking")
-                        await loop.run_in_executor(None, synthesize_and_play, last_text)
+                        await speak(last_text)
                         set_state("idle")
                     responding = False
 
@@ -235,7 +274,7 @@ async def main():
                     demo_idx += 1
                     print(f"Demo: {text}")
                     set_state("speaking")
-                    await loop.run_in_executor(None, synthesize_and_play, text)
+                    await speak(text)
                     last_text = text
                     set_state("idle")
                     responding = False
@@ -285,7 +324,7 @@ async def main():
 
                         if "stop" in query:
                             stop_music()
-                            await loop.run_in_executor(None, synthesize_and_play, "Stopped.")
+                            await speak("Stopped.", "en")
                             set_state("idle")
 
                         elif query.startswith("play") or " play " in query:
@@ -294,7 +333,7 @@ async def main():
                             set_state("thinking")
                             announcement = await loop.run_in_executor(None, play_youtube, song)
                             set_state("speaking")
-                            await loop.run_in_executor(None, synthesize_and_play, announcement)
+                            await speak(announcement, "en")
                             responding = False
                             set_state("idle")
 
@@ -307,7 +346,7 @@ async def main():
                             if needs_search(query):
                                 print(f"Searching: '{query}'")
                                 await asyncio.sleep(1)
-                                await loop.run_in_executor(None, synthesize_and_play, "Let me look that up for you.")
+                                await speak("Let me look that up for you.", "en")
                                 results = await loop.run_in_executor(None, web_search, query)
                                 snippets = "\n".join(
                                     f"- {r.get('title','')}: {r.get('body','')}"
@@ -340,14 +379,16 @@ async def main():
                         (getattr(event, "text", "") or "".join(text_buf)).strip()
                     )
                     text_buf.clear()
-                    if full_text:
-                        print(f"Ace: {full_text}")
-                        last_text = full_text
-                        set_state("speaking")
-                        await loop.run_in_executor(None, synthesize_and_play, full_text)
-                    responding = False
-                    set_state("idle")
-                    print("Say 'Ace' to continue.")
+                    try:
+                        if full_text:
+                            print(f"Ace: {full_text}")
+                            last_text = full_text
+                            set_state("speaking")
+                            await speak(full_text)
+                    finally:
+                        responding = False
+                        set_state("idle")
+                        print("Say 'Ace' to continue.")
 
                 elif t == "error":
                     print(f"Error: {getattr(event, 'error', {})}")
