@@ -1,228 +1,130 @@
 import pygame
-import pygame.gfxdraw
-import math
-import random
-import sys
 import os
+import sys
 import time
+
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE  = os.path.join(BASE_DIR, "ace_state.txt")
+
+ANIM_FPS    = 16
+BLINK_PAUSE = 3.5   # seconds between blinks
+LOOK_PAUSE  = 4.0   # seconds between looks
+
+STATE_FOLDERS = {
+    "idle":      "blink",
+    "listening": "blink",
+    "thinking":  "look",
+    "speaking":  "happy",
+}
 
 pygame.init()
 info = pygame.display.Info()
 W, H = info.current_w, info.current_h
-screen = pygame.display.set_mode((W, H), pygame.FULLSCREEN)
+screen = pygame.display.set_mode((W, H), pygame.NOFRAME)
 pygame.display.set_caption("Ace")
 clock = pygame.time.Clock()
 
-STATE_FILE = "ace_state.txt"
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+screen.fill((0, 0, 0))
+font = pygame.font.SysFont("Arial", 32)
+screen.blit(font.render("Loading...", True, (180, 180, 180)), (W // 2 - 60, H // 2 - 16))
+pygame.display.flip()
 
-BG_COLORS = {
-    'idle':      (155, 213, 200),
-    'listening': (108, 190, 252),
-    'thinking':  (208, 202, 108),
-    'speaking':  (102, 218, 148),
-    'happy':     (255, 210, 100),
-}
-BLACK = (22, 22, 22)
-WHITE = (255, 255, 255)
+def load_folder(folder_name):
+    folder = os.path.join(BASE_DIR, folder_name)
+    files  = sorted(f for f in os.listdir(folder) if f.lower().endswith('.png'))
+    result = []
+    for f in files:
+        img    = pygame.image.load(os.path.join(folder, f)).convert()
+        iw, ih = img.get_size()
+        scale  = min(W / iw, H / ih)
+        nw, nh = int(iw * scale), int(ih * scale)
+        scaled = pygame.transform.smoothscale(img, (nw, nh))
+        surf   = pygame.Surface((W, H))
+        surf.blit(scaled, ((W - nw) // 2, (H - nh) // 2))
+        result.append(surf)
+    print(f"  {folder_name}: {len(result)} frames")
+    return result
+
+anims = {}
+for folder in set(STATE_FOLDERS.values()):
+    anims[folder] = load_folder(folder)
+
+print("Ready.")
 
 def get_state():
     try:
-        s = open(os.path.join(BASE_DIR, STATE_FILE)).read().strip()
-        return s or 'idle'
+        with open(STATE_FILE, "r") as f:
+            s = f.read().strip()
+        return s if s in STATE_FOLDERS else "idle"
     except Exception:
-        return 'idle'
+        return "idle"
 
-def lerp(a, b, t):
-    return a + (b - a) * t
+def get_folder(state):
+    return STATE_FOLDERS.get(state, "blink")
 
-# ── Anti-aliased draw helpers ─────────────────────────────────
+# --- animation state ---
+cur_folder  = get_folder(get_state())
+frame_idx   = 0
+frame_time  = 0.0
+# cooldown before next blink/look (start with a natural delay)
+cooldown    = 1.5
+playing     = False   # True while mid-blink or mid-look
+last_poll   = 0.0
+last_state  = ""
 
-def aa_circle(surf, color, x, y, r):
-    if r < 1:
-        return
-    pygame.gfxdraw.filled_circle(surf, int(x), int(y), int(r), color)
-    pygame.gfxdraw.aacircle(surf, int(x), int(y), int(r), color)
+FRAME_DUR = 1.0 / ANIM_FPS
 
-def aa_ellipse(surf, color, x, y, rx, ry):
-    if rx < 1 or ry < 1:
-        return
-    pygame.gfxdraw.filled_ellipse(surf, int(x), int(y), int(rx), int(ry), color)
-    pygame.gfxdraw.aaellipse(surf, int(x), int(y), int(rx), int(ry), color)
+while True:
+    dt = min(clock.tick(60) / 1000.0, 0.05)
 
-def aa_arc(surf, color, cx, cy, rx, ry, a0, a1, thickness, steps=100):
-    """Smooth thick arc drawn as a filled polygon."""
-    hw = thickness / 2.0
-    outer, inner = [], []
-    for i in range(steps + 1):
-        a = a0 + (a1 - a0) * i / steps
-        ca, sa = math.cos(a), math.sin(a)
-        outer.append((cx + (rx + hw) * ca, cy + (ry + hw) * sa))
-        inner.append((cx + (rx - hw) * ca, cy + (ry - hw) * sa))
-    pts = [(int(p[0]), int(p[1])) for p in outer + list(reversed(inner))]
-    if len(pts) >= 3:
-        pygame.gfxdraw.filled_polygon(surf, pts, color)
-        pygame.gfxdraw.aapolygon(surf, pts, color)
+    for ev in pygame.event.get():
+        if ev.type == pygame.QUIT:
+            pygame.quit(); sys.exit()
+        if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+            pygame.quit(); sys.exit()
 
-def aa_pill(surf, color, x1, y, x2, half_w):
-    """Rounded horizontal line (pill shape)."""
-    if x2 <= x1:
-        x1, x2 = x2, x1
-    hw = int(half_w)
-    pygame.draw.rect(surf, color, (x1, y - hw, x2 - x1, hw * 2))
-    aa_circle(surf, color, x1, y, hw)
-    aa_circle(surf, color, x2, y, hw)
+    # Poll state every 100ms
+    now = time.time()
+    if now - last_poll > 0.1:
+        new_state  = get_state()
+        new_folder = get_folder(new_state)
+        if new_folder != cur_folder:
+            cur_folder = new_folder
+            frame_idx  = 0
+            frame_time = 0.0
+            playing    = False
+            cooldown   = 1.0   # brief pause before first cycle on new state
+        last_state = new_state
+        last_poll  = now
 
-# ── Vignette (pre-built once at startup) ─────────────────────
+    frames = anims[cur_folder]
 
-def make_vignette(W, H, strength=70):
-    surf = pygame.Surface((W, H), pygame.SRCALPHA)
-    edge = int(min(W, H) * 0.22)
-    for i in range(edge):
-        t = ((edge - i) / edge) ** 2
-        a = int(strength * t)
-        if a <= 0:
-            continue
-        c = (0, 0, 0, a)
-        pygame.draw.line(surf, c, (0, i),         (W, i))
-        pygame.draw.line(surf, c, (0, H - 1 - i), (W, H - 1 - i))
-        pygame.draw.line(surf, c, (i, 0),         (i, H))
-        pygame.draw.line(surf, c, (W - 1 - i, 0), (W - 1 - i, H))
-    return surf
+    if cur_folder in ("blink", "look"):
+        pause = BLINK_PAUSE if cur_folder == "blink" else LOOK_PAUSE
 
-# ── Main ─────────────────────────────────────────────────────
-
-def main():
-    print("Preparing display…")
-    vignette = make_vignette(W, H)
-    print("Ready.")
-
-    state     = 'idle'
-    bg        = list(map(float, BG_COLORS['idle']))
-    t         = 0.0
-    last_read = 0.0
-
-    blink       = 1.0
-    blink_phase = 0
-    blink_cd    = 2.0 + random.random() * 2.5
-
-    mouth_open  = 0.0
-    mouth_curve = 0.8
-    pupil_dx    = 0.0
-    pupil_dy    = 0.0
-    eye_size    = 1.0
-    talk_t      = 0.0
-
-    while True:
-        dt = min(clock.tick(60) / 1000.0, 0.05)
-        t += dt
-
-        for ev in pygame.event.get():
-            if ev.type == pygame.QUIT:
-                pygame.quit(); sys.exit()
-            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
-                pygame.quit(); sys.exit()
-
-        now = time.time()
-        if now - last_read > 0.1:
-            state     = get_state()
-            last_read = now
-
-        # Background colour lerp
-        tgt = BG_COLORS.get(state, BG_COLORS['idle'])
-        for i in range(3):
-            bg[i] = lerp(bg[i], tgt[i], min(1.0, dt * 4))
-        bg_col = tuple(int(x) for x in bg)
-
-        # Blink
-        blink_cd -= dt
-        if blink_phase == 0 and blink_cd <= 0:
-            blink_phase = 1
-            blink_cd    = 2.5 + random.random() * 3.5
-        if blink_phase == 1:
-            blink = max(0.0, blink - dt * 16)
-            if blink == 0.0:
-                blink_phase = 2
-        elif blink_phase == 2:
-            blink = min(1.0, blink + dt * 10)
-            if blink == 1.0:
-                blink_phase = 0
-        if state == 'listening':
-            blink = min(1.0, blink + dt * 8)
-
-        # Per-state targets
-        t_mo = 0.0; t_mc = 0.78; t_pdx = 0.0; t_pdy = 0.0; t_es = 1.0
-
-        if state == 'happy':
-            t_mc = 1.0
-        elif state == 'listening':
-            t_mo = 0.18; t_mc = 0.0; t_es = 1.1
-        elif state == 'thinking':
-            t_pdx = -0.3; t_pdy = -0.25; t_mc = 0.0
-        elif state == 'speaking':
-            talk_t += dt * 9
-            t_mo = (abs(math.sin(talk_t * 0.71)) * 0.55
-                  + abs(math.sin(talk_t * 1.29)) * 0.28
-                  + 0.08)
-            t_mc = 0.15
-
-        sp          = min(1.0, dt * 10)
-        mouth_open  = lerp(mouth_open,  t_mo,  sp * 1.5)
-        mouth_curve = lerp(mouth_curve, t_mc,  sp * 0.65)
-        pupil_dx    = lerp(pupil_dx,    t_pdx, sp)
-        pupil_dy    = lerp(pupil_dy,    t_pdy, sp)
-        eye_size    = lerp(eye_size,    t_es,  sp * 0.7)
-
-        # ── Draw ─────────────────────────────────────────────
-        screen.fill(bg_col)
-
-        cx, cy = W // 2, H // 2
-        R  = min(W, H)
-        lw = max(4, int(R * 0.011))
-
-        er      = int(R * 0.056 * eye_size)
-        eox     = int(W * 0.135)
-        eye_y   = cy - int(H * 0.09)
-        mw      = int(W * 0.19)
-        mouth_y = cy + int(H * 0.15)
-
-        # Eyes
-        for side in [-1, 1]:
-            ex = cx + side * eox
-            ey = eye_y
-
-            aa_circle(screen, BLACK, ex, ey, er)
-
-            # Eyelid cover (bg colour rectangle clipped to circle area)
-            if blink < 0.999:
-                cv = int(er * (1 - blink)) + 1
-                pygame.draw.rect(screen, bg_col,
-                    (ex - er - 2, ey - er - 2,    er * 2 + 4, cv + 1))
-                pygame.draw.rect(screen, bg_col,
-                    (ex - er - 2, ey + int(er * blink) - 1, er * 2 + 4, cv + 2))
-
-            # White highlight
-            if blink > 0.25:
-                hx = ex + int(pupil_dx * er * 0.5) - int(er * 0.24)
-                hy = ey + int(pupil_dy * er * 0.5) - int(er * 0.22)
-                aa_circle(screen, WHITE, hx, hy, max(2, int(er * 0.27)))
-
-        # Mouth
-        if mouth_open > 0.04:
-            oh = max(4, int(mouth_open * R * 0.1))
-            aa_ellipse(screen, BLACK, cx, mouth_y, mw // 2, oh // 2)
+        if playing:
+            frame_time += dt
+            if frame_time >= FRAME_DUR:
+                frame_time -= FRAME_DUR
+                frame_idx  += 1
+                if frame_idx >= len(frames):
+                    # cycle done — reset to frame 0 and wait
+                    frame_idx = 0
+                    playing   = False
+                    cooldown  = pause
         else:
-            if mouth_curve > 0.02:
-                ry = max(3, int(mouth_curve * mw * 0.38))
-                aa_arc(screen, BLACK, cx, mouth_y, mw // 2, ry, 0, math.pi, lw)
-            else:
-                shift = int(math.sin(t * 1.8) * mw * 0.08) if state == 'thinking' else 0
-                aa_pill(screen, BLACK,
-                        cx - mw // 3 + shift, mouth_y,
-                        cx + mw // 3 + shift, lw // 2)
+            cooldown -= dt
+            if cooldown <= 0:
+                playing    = True
+                frame_time = 0.0
 
-        screen.blit(vignette, (0, 0))
-        pygame.display.flip()
+    elif cur_folder == "happy":
+        # play to last frame then hold
+        if frame_idx < len(frames) - 1:
+            frame_time += dt
+            if frame_time >= FRAME_DUR:
+                frame_time -= FRAME_DUR
+                frame_idx  += 1
 
-if __name__ == '__main__':
-    main()
+    screen.blit(frames[frame_idx], (0, 0))
+    pygame.display.flip()
